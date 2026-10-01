@@ -1,0 +1,20 @@
+# Makefile_235 - RemoteOps (IE3090 Assignment) for IT24102235
+# Usage:  make -f Makefile_235          build agent_235 and controller_235
+#         make -f Makefile_235 clean    remove the binaries
+
+CC      = gcc
+CFLAGS  = -Wall -Wextra -O2 -pthread
+LDFLAGS = -pthread
+
+all: agent_235 controller_235
+
+agent_235: agent_235.c
+	$(CC) $(CFLAGS) -o agent_235 agent_235.c $(LDFLAGS)
+
+controller_235: controller_235.c
+	$(CC) $(CFLAGS) -o controller_235 controller_235.c $(LDFLAGS)
+
+clean:
+	rm -f agent_235 controller_235
+
+.PHONY: all clean
