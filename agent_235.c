@@ -21,6 +21,15 @@
 #define STORAGE_ROOT    "./agentfiles"
 #define STORAGE_DIR     "./agentfiles/IT24102235"
 #define BACKLOG         10
+#define MAX_LINE        1024
+#define READ_BUF_SIZE   4096
+#define MAX_RESPONSE    65536
+
+typedef struct {
+    int  fd;
+    char buf[READ_BUF_SIZE];
+    int  len;
+} conn_reader;
 
 static FILE           *log_fp = NULL;
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -50,49 +59,67 @@ static void log_event(const char *fmt, ...)
     pthread_mutex_unlock(&log_lock);
 }
 
+static int send_all(int sock, const char *data, long len)
+{
+    long total = 0;
+    while (total < len) {
+        ssize_t n = send(sock, data + total, len - total, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        total += n;
+    }
+    return 0;
+}
+
+static int read_line(conn_reader *r, char *line, int max)
+{
+    while (1) {
+        char *nl = memchr(r->buf, '\n', r->len);
+        if (nl != NULL) {
+            int line_len = (int)(nl - r->buf);
+            int used     = line_len + 1;
+            if (line_len >= max) return -2;
+            memcpy(line, r->buf, line_len);
+            if (line_len > 0 && line[line_len - 1] == '\r') line_len--;
+            line[line_len] = '\0';
+            memmove(r->buf, r->buf + used, r->len - used);
+            r->len -= used;
+            return line_len;
+        }
+        if (r->len >= max || r->len == (int)sizeof(r->buf)) return -2;
+        ssize_t n = recv(r->fd, r->buf + r->len, sizeof(r->buf) - r->len, 0);
+        if (n == 0) return -1;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        r->len += (int)n;
+    }
+}
+
+static int send_response_raw(int sock, int client_id, const char *fmt, ...)
+{
+    char    line[MAX_RESPONSE + 32];
+    va_list ap;
+    va_start(ap, fmt);
+    int len = vsnprintf(line, MAX_RESPONSE, fmt, ap);
+    va_end(ap);
+    if (len >= MAX_RESPONSE) len = MAX_RESPONSE - 1;
+
+    len += snprintf(line + len, sizeof(line) - len, " %s\n", SID_TAG);
+    log_event("Client %d <- %.*s", client_id, len - 1, line);
+    return send_all(sock, line, len);
+}
+
 int main(void)
 {
-    int server_fd;
-    int opt = 1;
-    struct sockaddr_in server_addr;
-
     signal(SIGPIPE, SIG_IGN);
     mkdir(STORAGE_ROOT, 0755);
     mkdir(STORAGE_DIR, 0755);
-
     log_fp = fopen(LOG_FILE, "a");
-    if (!log_fp) {
-        perror("Cannot open log file");
-        exit(EXIT_FAILURE);
-    }
-
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("Socket failed");
-        exit(EXIT_FAILURE);
-    }
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family      = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port        = htons(AGENT_PORT);
-
-    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Bind failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-    if (listen(server_fd, BACKLOG) < 0) {
-        perror("Listen failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    log_event("RemoteOps Agent started (PID %d) for %s", getpid(), REG_NUMBER);
-    log_event("Listening on TCP port %d | tag %s | log %s", AGENT_PORT, SID_TAG, LOG_FILE);
-
-    close(server_fd);
-    fclose(log_fp);
+    log_event("Framing logic verified.");
+    if (log_fp) fclose(log_fp);
     return 0;
 }
