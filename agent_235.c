@@ -24,12 +24,28 @@
 #define MAX_LINE        1024
 #define READ_BUF_SIZE   4096
 #define MAX_RESPONSE    65536
+#define MAX_TOKENS      4
+#define MAX_AUTH_ATTEMPTS 3
+
+#define E_AUTH_FAILED   "001 AUTH_FAILED"
+#define E_NOT_AUTH      "003 NOT_AUTHENTICATED"
+#define E_UNKNOWN       "006 UNKNOWN_COMMAND"
 
 typedef struct {
     int  fd;
     char buf[READ_BUF_SIZE];
     int  len;
 } conn_reader;
+
+typedef struct {
+    int                client_id;
+    int                sock;
+    struct sockaddr_in addr;
+    char               peer[64];
+    conn_reader        reader;
+    int                authenticated;
+    int                auth_attempts;
+} session_t;
 
 static FILE           *log_fp = NULL;
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -99,7 +115,7 @@ static int read_line(conn_reader *r, char *line, int max)
     }
 }
 
-static int send_response_raw(int sock, int client_id, const char *fmt, ...)
+static int send_response(session_t *s, const char *fmt, ...)
 {
     char    line[MAX_RESPONSE + 32];
     va_list ap;
@@ -107,19 +123,121 @@ static int send_response_raw(int sock, int client_id, const char *fmt, ...)
     int len = vsnprintf(line, MAX_RESPONSE, fmt, ap);
     va_end(ap);
     if (len >= MAX_RESPONSE) len = MAX_RESPONSE - 1;
-
     len += snprintf(line + len, sizeof(line) - len, " %s\n", SID_TAG);
-    log_event("Client %d <- %.*s", client_id, len - 1, line);
-    return send_all(sock, line, len);
+    log_event("Client %d <- %.*s", s->client_id, len - 1, line);
+    return send_all(s->sock, line, len);
+}
+
+static int split_tokens(char *line, char *tokens[], int max_tokens)
+{
+    char *save = NULL;
+    int   count = 0;
+    char *tok = strtok_r(line, " \t", &save);
+    while (tok != NULL) {
+        if (count == max_tokens) return max_tokens + 1;
+        tokens[count++] = tok;
+        tok = strtok_r(NULL, " \t", &save);
+    }
+    return count;
+}
+
+static int handle_command(session_t *s, char *line)
+{
+    char  copy[MAX_LINE];
+    char *tokens[MAX_TOKENS];
+    int   ntok;
+
+    if (strncmp(line, "AUTH ", 5) == 0) log_event("Client %d -> AUTH ********", s->client_id);
+    else log_event("Client %d -> %s", s->client_id, line);
+
+    snprintf(copy, sizeof(copy), "%s", line);
+    ntok = split_tokens(copy, tokens, MAX_TOKENS);
+    if (ntok == 0) return 1;
+
+    if (strcmp(tokens[0], "AUTH") == 0) {
+        if (ntok == 2 && strcmp(tokens[1], AUTH_TOKEN) == 0) {
+            s->authenticated = 1;
+            log_event("Client %d AUTH success", s->client_id);
+            send_response(s, "OK AUTHENTICATED");
+            return 1;
+        }
+        s->auth_attempts++;
+        send_response(s, "ERR %s", E_AUTH_FAILED);
+        return (s->auth_attempts < MAX_AUTH_ATTEMPTS);
+    }
+
+    if (!s->authenticated) {
+        send_response(s, "ERR %s", E_NOT_AUTH);
+        return 1;
+    }
+
+    if (strcmp(tokens[0], "QUIT") == 0) {
+        send_response(s, "OK BYE");
+        return 0;
+    }
+
+    send_response(s, "ERR %s", E_UNKNOWN);
+    return 1;
+}
+
+static void *client_thread(void *arg)
+{
+    session_t *s = (session_t *)arg;
+    char       line[MAX_LINE];
+    int        keep_open = 1;
+
+    log_event("Client %d connected from %s", s->client_id, s->peer);
+    while (keep_open) {
+        int n = read_line(&s->reader, line, sizeof(line));
+        if (n <= 0) break;
+        keep_open = handle_command(s, line);
+    }
+    close(s->sock);
+    log_event("Client %d disconnected", s->client_id);
+    free(s);
+    return NULL;
 }
 
 int main(void)
 {
+    int server_fd, opt = 1, next_client_id = 1;
+    struct sockaddr_in server_addr;
+
     signal(SIGPIPE, SIG_IGN);
     mkdir(STORAGE_ROOT, 0755);
     mkdir(STORAGE_DIR, 0755);
+
     log_fp = fopen(LOG_FILE, "a");
-    log_event("Framing logic verified.");
-    if (log_fp) fclose(log_fp);
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family      = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port        = htons(AGENT_PORT);
+
+    bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    listen(server_fd, BACKLOG);
+
+    log_event("RemoteOps Agent ready on port %d", AGENT_PORT);
+
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        pthread_t tid;
+
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
+        if (client_fd < 0) continue;
+
+        session_t *s = calloc(1, sizeof(session_t));
+        s->client_id = next_client_id++;
+        s->sock      = client_fd;
+        s->addr      = client_addr;
+        s->reader.fd = client_fd;
+        inet_ntop(AF_INET, &client_addr.sin_addr, s->peer, sizeof(s->peer));
+
+        pthread_create(&tid, NULL, client_thread, s);
+        pthread_detach(tid);
+    }
     return 0;
 }
