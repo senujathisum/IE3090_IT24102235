@@ -28,6 +28,7 @@
 #define MAX_AUTH_ATTEMPTS 3
 
 #define E_AUTH_FAILED   "001 AUTH_FAILED"
+#define E_NOT_ALLOWED   "002 COMMAND_NOT_ALLOWED"
 #define E_NOT_AUTH      "003 NOT_AUTHENTICATED"
 #define E_UNKNOWN       "006 UNKNOWN_COMMAND"
 #define E_INTERNAL      "011 INTERNAL_ERROR"
@@ -200,6 +201,44 @@ static void cmd_listproc(session_t *s)
     send_response(s, "OK PROCS %s", list);
 }
 
+static const char *whitelist_lookup(const char *name)
+{
+    if (strcmp(name, "DATE") == 0)     return "date";
+    if (strcmp(name, "UPTIME") == 0)   return "uptime";
+    if (strcmp(name, "DISKFREE") == 0) return "df -h /";
+    if (strcmp(name, "HOSTNAME") == 0) return "uname -n";
+    if (strcmp(name, "WHOAMI") == 0)   return "whoami";
+    return NULL;
+}
+
+static void cmd_exec(session_t *s, char *tokens[], int ntok)
+{
+    char output[4096] = {0}, line[512];
+    int used = 0;
+    if (ntok != 2) {
+        send_response(s, "ERR %s", E_BAD_ARGS);
+        return;
+    }
+    const char *command = whitelist_lookup(tokens[1]);
+    if (!command) {
+        send_response(s, "ERR %s", E_NOT_ALLOWED);
+        return;
+    }
+    FILE *fp = popen(command, "r");
+    if (!fp) {
+        send_response(s, "ERR %s", E_INTERNAL);
+        return;
+    }
+    while (fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (line[0] == '\0') continue;
+        used += snprintf(output + used, sizeof(output) - used, "%s%s", used ? " | " : "", line);
+        if (used >= (int)sizeof(output) - 1) break;
+    }
+    pclose(fp);
+    send_response(s, "OK EXEC_RESULT %s", output[0] ? output : "(no output)");
+}
+
 static int split_tokens(char *line, char *tokens[], int max_tokens)
 {
     char *save = NULL;
@@ -249,6 +288,8 @@ static int handle_command(session_t *s, char *line)
     } else if (strcmp(tokens[0], "LISTPROC") == 0) {
         if (ntok != 1) send_response(s, "ERR %s", E_BAD_ARGS);
         else cmd_listproc(s);
+    } else if (strcmp(tokens[0], "EXEC") == 0) {
+        cmd_exec(s, tokens, ntok);
     } else if (strcmp(tokens[0], "QUIT") == 0) {
         send_response(s, "OK BYE");
         return 0;
