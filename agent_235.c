@@ -30,6 +30,8 @@
 #define E_AUTH_FAILED   "001 AUTH_FAILED"
 #define E_NOT_AUTH      "003 NOT_AUTHENTICATED"
 #define E_UNKNOWN       "006 UNKNOWN_COMMAND"
+#define E_INTERNAL      "011 INTERNAL_ERROR"
+#define E_BAD_ARGS      "007 INVALID_ARGUMENTS"
 
 typedef struct {
     int  fd;
@@ -128,6 +130,76 @@ static int send_response(session_t *s, const char *fmt, ...)
     return send_all(s->sock, line, len);
 }
 
+static void get_sysinfo(double *cpu_load, long *mem_used_mb, long *uptime_sec)
+{
+    FILE  *fp;
+    char   line[256];
+    long   mem_total_kb = 0, mem_avail_kb = 0;
+    double up = 0.0;
+
+    *cpu_load = 0.0;
+    *mem_used_mb = 0;
+    *uptime_sec = 0;
+
+    fp = fopen("/proc/loadavg", "r");
+    if (fp != NULL) {
+        if (fscanf(fp, "%lf", cpu_load) != 1) *cpu_load = 0.0;
+        fclose(fp);
+    }
+    fp = fopen("/proc/meminfo", "r");
+    if (fp != NULL) {
+        while (fgets(line, sizeof(line), fp) != NULL) {
+            sscanf(line, "MemTotal: %ld kB", &mem_total_kb);
+            sscanf(line, "MemAvailable: %ld kB", &mem_avail_kb);
+        }
+        fclose(fp);
+        *mem_used_mb = (mem_total_kb - mem_avail_kb) / 1024;
+    }
+    fp = fopen("/proc/uptime", "r");
+    if (fp != NULL) {
+        if (fscanf(fp, "%lf", &up) == 1) *uptime_sec = (long)up;
+        fclose(fp);
+    }
+}
+
+static void cmd_sysinfo(session_t *s)
+{
+    double cpu;
+    long   mem, up;
+    get_sysinfo(&cpu, &mem, &up);
+    send_response(s, "OK SYSINFO %.2f %ld %ld", cpu, mem, up);
+}
+
+static void cmd_listproc(session_t *s)
+{
+    char  list[MAX_RESPONSE - 256];
+    char  line[512];
+    int   used = 0, count = 0;
+    FILE *fp = popen("ps -e -o pid=,comm=", "r");
+    if (!fp) {
+        send_response(s, "ERR %s", E_INTERNAL);
+        return;
+    }
+
+    list[0] = '\0';
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        int  pid;
+        char name[256];
+        line[strcspn(line, "\n")] = '\0';
+        if (sscanf(line, "%d %255[^\n]", &pid, name) != 2) continue;
+        for (char *p = name; *p; p++) if (*p == ',') *p = '_';
+        int need = snprintf(NULL, 0, "%s%d:%s", count ? "," : "", pid, name);
+        if (used + need >= (int)sizeof(list) - 4) {
+            strcat(list, ",...");
+            break;
+        }
+        used += sprintf(list + used, "%s%d:%s", count ? "," : "", pid, name);
+        count++;
+    }
+    pclose(fp);
+    send_response(s, "OK PROCS %s", list);
+}
+
 static int split_tokens(char *line, char *tokens[], int max_tokens)
 {
     char *save = NULL;
@@ -171,12 +243,18 @@ static int handle_command(session_t *s, char *line)
         return 1;
     }
 
-    if (strcmp(tokens[0], "QUIT") == 0) {
+    if (strcmp(tokens[0], "SYSINFO") == 0) {
+        if (ntok != 1) send_response(s, "ERR %s", E_BAD_ARGS);
+        else cmd_sysinfo(s);
+    } else if (strcmp(tokens[0], "LISTPROC") == 0) {
+        if (ntok != 1) send_response(s, "ERR %s", E_BAD_ARGS);
+        else cmd_listproc(s);
+    } else if (strcmp(tokens[0], "QUIT") == 0) {
         send_response(s, "OK BYE");
         return 0;
+    } else {
+        send_response(s, "ERR %s", E_UNKNOWN);
     }
-
-    send_response(s, "ERR %s", E_UNKNOWN);
     return 1;
 }
 
