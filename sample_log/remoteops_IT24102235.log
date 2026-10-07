@@ -1,0 +1,3 @@
+[2026-10-07 21:24:39] RemoteOps Agent started (PID 10250) for IT24102235
+[2026-10-07 21:24:39] Listening on TCP port 9410 | tag SID:5322 | log remoteops_IT24102235.log | storage ./agentfiles/IT24102235/
+[2026-10-07 21:24:51] Client 1 connected from 127.0.0.1:50924 (thread handling it)
